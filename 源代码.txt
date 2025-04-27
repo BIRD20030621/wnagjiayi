@@ -1,0 +1,613 @@
+# -*- coding: utf-8 -*-
+# 新增导入
+import matplotlib.pyplot as plt  # 添加此行
+import pandas as pd
+import numpy as np
+from scipy.stats import kurtosis  # 关键修复
+import torch
+import torch.nn as nn
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, LabelEncoder, OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import accuracy_score, roc_auc_score
+from tqdm import tqdm
+import mne
+import matplotlib.pyplot as plt
+import shap
+from scipy import stats
+from statsmodels.stats.multicomp import pairwise_tukeyhsd
+from IPython.display import display, Javascript
+display(Javascript('IPython.notebook.execute_cells_below()'))
+plt.rcParams['font.sans-serif'] = ['SimHei']  # 设置中文字体
+plt.rcParams['axes.unicode_minus'] = False    # 修复负号显示为方块
+# 启用 tqdm 对 pandas 的支持
+tqdm.pandas()
+# 加载数据
+eeg = pd.read_csv("EEG_data.csv")
+subjects = pd.read_csv("Subject_details.csv")
+videos = pd.read_csv("Video_details.csv")
+print("DataFrame 列名列表:", eeg.columns.tolist())
+sfreq = 128
+# 定义EEG通道参数（根据Emotiv Epoc X布局）
+emotiv_channels = [
+   'EEG.AF3', 'EEG.F7', 'EEG.F3', 'EEG.FC5', 'EEG.T7', 'EEG.P7', 'EEG.O1',
+    'EEG.O2', 'EEG.P8', 'EEG.T8', 'EEG.FC6', 'EEG.F4', 'EEG.F8', 'EEG.AF4',
+    'POW.AF3.Theta', 'POW.AF3.Alpha', 'POW.AF3.BetaL', 'POW.AF3.BetaH',
+    'POW.AF3.Gamma', 'POW.F7.Theta', 'POW.F7.Alpha', 'POW.F7.BetaL', 
+    'POW.F7.BetaH', 'POW.F7.Gamma', 'POW.F3.Theta', 'POW.F3.Alpha',
+    'POW.F3.BetaL', 'POW.F3.BetaH', 'POW.F3.Gamma', 'POW.FC5.Theta', 
+    'POW.FC5.Alpha', 'POW.FC5.BetaL', 'POW.FC5.BetaH', 'POW.FC5.Gamma',
+    'POW.T7.Theta', 'POW.T7.Alpha', 'POW.T7.BetaL', 'POW.T7.BetaH', 
+    'POW.T7.Gamma', 'POW.P7.Theta', 'POW.P7.Alpha', 'POW.P7.BetaL', 
+    'POW.P7.BetaH', 'POW.P7.Gamma', 'POW.O1.Theta', 'POW.O1.Alpha',
+    'POW.O1.BetaL', 'POW.O1.BetaH', 'POW.O1.Gamma', 'POW.O2.Theta',
+    'POW.O2.Alpha', 'POW.O2.BetaL', 'POW.O2.BetaH', 'POW.O2.Gamma', 
+    'POW.P8.Theta', 'POW.P8.Alpha', 'POW.P8.BetaL', 'POW.P8.BetaH', 
+    'POW.P8.Gamma', 'POW.T8.Theta', 'POW.T8.Alpha', 'POW.T8.BetaL', 
+    'POW.T8.BetaH', 'POW.T8.Gamma', 'POW.FC6.Theta', 'POW.FC6.Alpha',
+    'POW.FC6.BetaL', 'POW.FC6.BetaH', 'POW.FC6.Gamma', 'POW.F4.Theta', 
+    'POW.F4.Alpha', 'POW.F4.BetaL', 'POW.F4.BetaH', 'POW.F4.Gamma', 
+    'POW.F8.Theta', 'POW.F8.Alpha', 'POW.F8.BetaL', 'POW.F8.BetaH', 
+    'POW.F8.Gamma', 'POW.AF4.Theta', 'POW.AF4.Alpha', 'POW.AF4.BetaL', 
+    'POW.AF4.BetaH', 'POW.AF4.Gamma', 'subject_understood'
+]
+sfreq = 128  # Emotiv Epoc X的采样率
+def preprocess_eeg_pipeline(group):
+    """EEG预处理流水线（全自动版）"""
+    # 步骤1：创建原始数据结构
+    raw_data = group[emotiv_channels].values.T * 1e-6
+    info = mne.create_info(ch_names=emotiv_channels, sfreq=sfreq, ch_types='eeg')
+    raw = mne.io.RawArray(raw_data, info)
+    
+    # 步骤2：带通滤波（1-40 Hz）
+    raw.filter(1, 40, fir_design='firwin', phase='zero-double')
+    
+    # 步骤3：全自动伪迹处理
+    ica = mne.preprocessing.ICA(n_components=14, method='infomax', random_state=42)
+    ica.fit(raw)
+    
+    # --- 自动检测伪迹成分 ---
+    kurtosis_scores = ica.score_sources(
+        raw, 
+        score_func=lambda x, _: np.abs(kurtosis(x, axis=1))
+    )
+    high_kurt_components = np.where(kurtosis_scores > 5.0)[0]
+    
+    front_channels = ['EEG.AF3', 'EEG.F7', 'EEG.F3', 'EEG.FC5', 'EEG.AF4', 'EEG.F4', 'EEG.F8', 'EEG.FC6']
+    front_weights = np.mean(
+        np.abs(ica.mixing_matrix_[:, [emotiv_channels.index(ch) for ch in front_channels]]), 
+        axis=1
+    )
+    front_components = np.where(front_weights > np.percentile(front_weights, 90))[0]
+    
+    exclude_components = list(set(high_kurt_components) | set(front_components))
+    ica.exclude = exclude_components[:2]
+    
+    if len(exclude_components) > 0:
+        ica.apply(raw)
+    
+    # 步骤4：空间滤波（平均参考）
+    raw.set_eeg_reference(ref_channels='average')
+    
+    # 步骤5：稳健归一化
+    data = raw.get_data()
+    data_mean = np.mean(data, axis=1, keepdims=True)
+    data_std = np.std(data, axis=1, keepdims=True)
+    data_std[data_std < 1e-6] = 1e-6
+    data = (data - data_mean) / data_std
+    
+    # 更新处理后的数据
+    group[emotiv_channels] = data.T * 1e6
+    return group
+# 按被试和视频分组应用预处理
+print("正在预处理EEG数据...")
+eeg_processed = eeg.groupby(['subject_id', 'video_id'], group_keys=False).progress_apply(preprocess_eeg_pipeline)
+group_keys = list(eeg.groupby(['subject_id', 'video_id']).groups.keys())
+if not group_keys:
+    raise ValueError("数据中没有可用的分组！")
+first_group_key = group_keys[0]
+print(f"\n测试分组: {first_group_key}")
+try:
+    test_group = eeg.groupby(['subject_id', 'video_id']).get_group(first_group_key)
+    processed = preprocess_eeg_pipeline(test_group.copy())
+except KeyError as e:
+    print(f"错误：分组 {first_group_key} 不存在！")
+    raise
+# 绘制对比图
+plt.figure(figsize=(12, 6))
+plt.subplot(211)
+plt.plot(test_group['EEG.AF3'].values[:500], label='原始信号')
+plt.title('原始EEG信号')
+plt.subplot(212)
+plt.plot(processed['EEG.AF3'].values[:500], label='处理后信号')
+plt.title('预处理后信号')
+plt.tight_layout()
+plt.show()
+# 合并数据
+merged = eeg.merge(
+    subjects,
+    left_on="subject_id",    # EEG_data 中的列
+    right_on="Subject_ID",    # Subject_details 中的列
+    how="left"
+)
+merged = merged.merge(
+    videos,
+    left_on="video_id",
+    right_on="Video_ID",    # 如果列名不一致需指定 right_on
+    how="left"
+)
+print(merged.head())
+# 定义特征类型
+# 数值型特征
+numeric_features = [col for col in merged.columns if col.startswith('EEG.') or col.startswith('POW.')] + ['Age']
+# 分类特征（需要编码）
+categorical_features = ['Education Level', 'Gender', 'Fields of Interest', 'Ethnicity']  # 根据实际需要调整
+# 目标变量
+y = merged['subject_understood'].values
+# 创建预处理管道
+numeric_transformer = Pipeline(steps=[
+    ('imputer', SimpleImputer(strategy='median')),  # 处理缺失值
+    ('scaler', StandardScaler())  # 标准化
+])
+categorical_transformer = Pipeline(steps=[
+    ('imputer', SimpleImputer(strategy='most_frequent')),  # 处理缺失值
+    ('onehot', OneHotEncoder(handle_unknown='ignore'))  # 独热编码
+])
+preprocessor = ColumnTransformer(
+    transformers=[
+        ('num', numeric_transformer, numeric_features),
+        ('cat', categorical_transformer, categorical_features)
+    ])
+# 应用预处理
+X_processed = preprocessor.fit_transform(merged)
+# 获取特征名称（用于理解）
+numeric_feature_names = numeric_features
+categorical_feature_names = preprocessor.named_transformers_['cat'].get_feature_names_out(categorical_features)
+all_feature_names = list(numeric_feature_names) + list(categorical_feature_names)
+print(f"处理后的特征矩阵形状: {X_processed.shape}")
+print(f"目标变量形状: {y.shape}")
+# 划分数据集
+X_train, X_test, y_train, y_test = train_test_split(
+    X_processed, y, test_size=0.2, stratify=y, random_state=42)
+# 转换为PyTorch张量
+X_train_tensor = torch.FloatTensor(X_train.toarray() if hasattr(X_train, "toarray") else X_train)
+X_test_tensor = torch.FloatTensor(X_test.toarray() if hasattr(X_test, "toarray") else X_test)
+y_train_tensor = torch.FloatTensor(y_train).reshape(-1, 1)
+y_test_tensor = torch.FloatTensor(y_test).reshape(-1, 1)
+class EEGClassifier(nn.Module):
+    def __init__(self, input_dim):
+        super().__init__()
+        self.layers = nn.Sequential(
+            nn.Linear(input_dim, 256),
+            nn.ReLU(),
+            nn.BatchNorm1d(256),
+            nn.Dropout(0.5),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.BatchNorm1d(128),
+            nn.Dropout(0.3),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1),
+            nn.Sigmoid()
+        )
+    
+    def forward(self, x):
+        return self.layers(x)
+# 初始化模型
+model = EEGClassifier(X_train_tensor.shape[1])
+criterion = nn.BCELoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
+# 训练函数
+def train_model(model, criterion, optimizer, X_train, y_train, X_test, y_test, epochs=50, batch_size=32):
+    train_losses = []
+    test_losses = []
+    accuracies = []
+    
+    for epoch in range(epochs):
+        model.train()
+        permutation = torch.randperm(X_train.size()[0])
+        
+        for i in range(0, X_train.size()[0], batch_size):
+            indices = permutation[i:i+batch_size]
+            batch_X, batch_y = X_train[indices], y_train[indices]
+            
+            optimizer.zero_grad()
+            outputs = model(batch_X)
+            loss = criterion(outputs, batch_y)
+            loss.backward()
+            optimizer.step()
+        
+        # 评估
+        model.eval()
+        with torch.no_grad():
+            # 训练集评估
+            train_outputs = model(X_train)
+            train_loss = criterion(train_outputs, y_train)
+            
+            # 测试集评估
+            test_outputs = model(X_test)
+            test_loss = criterion(test_outputs, y_test)
+            
+            # 计算准确率
+            predicted = (test_outputs > 0.5).float()
+            accuracy = (predicted == y_test).float().mean()
+            
+        train_losses.append(train_loss.item())
+        test_losses.append(test_loss.item())
+        accuracies.append(accuracy.item())
+        
+        if (epoch+1) % 5 == 0:
+            print(f'Epoch {epoch+1}/{epochs}, Train Loss: {train_loss.item():.4f}, Test Loss: {test_loss.item():.4f}, Accuracy: {accuracy.item():.4f}')
+    
+    return train_losses, test_losses, accuracies
+# 训练模型
+train_losses, test_losses, accuracies = train_model(
+    model, criterion, optimizer, 
+    X_train_tensor, y_train_tensor, 
+    X_test_tensor, y_test_tensor,
+    epochs=100, batch_size=64
+)
+# 最终评估
+model.eval()
+with torch.no_grad():
+    y_pred = model(X_test_tensor)
+    y_pred_class = (y_pred > 0.5).float()
+    test_accuracy = accuracy_score(y_test, y_pred_class.numpy())
+    test_auc = roc_auc_score(y_test, y_pred.numpy())
+    
+print(f"\nFinal Test Accuracy: {test_accuracy:.4f}")
+print(f"Final Test AUC: {test_auc:.4f}")
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy import stats
+from statsmodels.stats.multicomp import pairwise_tukeyhsd
+import warnings
+from IPython.display import display, Javascript
+display(Javascript('IPython.notebook.execute_cells_below()'))
+# 设置中文显示和忽略警告
+plt.rcParams['font.sans-serif'] = ['SimHei']
+plt.rcParams['axes.unicode_minus'] = False
+warnings.filterwarnings('ignore')
+def education_level_analysis(merged_df):
+    """教育水平与理解率的基础分析"""
+    print("\n正在分析教育水平与理解率的关系...")
+    
+    # 统计计算
+    edu_stats = merged_df.groupby('Education Level')['subject_understood'].agg(
+        ['mean', 'std', 'count']
+    ).reset_index()
+    edu_stats.columns = ['教育水平', '平均理解率', '标准差', '样本数']
+    
+    # 可视化
+    plt.figure(figsize=(10, 6))
+    bars = plt.bar(edu_stats['教育水平'], edu_stats['平均理解率'], 
+                  yerr=edu_stats['标准差'], capsize=5, color='skyblue')
+    plt.ylabel('理解率', fontsize=12)
+    plt.title('不同教育水平理解率分布', fontsize=14)
+    
+    # 添加数值标签
+    for bar in bars:
+        height = bar.get_height()
+        plt.text(bar.get_x() + bar.get_width()/2., height,
+                f'{height:.2f}',
+                ha='center', va='bottom', fontsize=10)
+    
+    plt.xticks(rotation=45)
+    plt.grid(axis='y', linestyle='--', alpha=0.7)
+    plt.tight_layout()
+    plt.show()
+    
+    # 打印统计结果
+    print("\n教育水平统计结果：")
+    print(edu_stats)
+    
+    return edu_stats
+def band_education_analysis(merged_df, band='Theta'):
+    """专业化的波段教育分析"""
+    print(f"\n正在进行{band}波功率教育水平差异分析...")
+    
+    # 筛选特征（更健壮的方式）
+    features = [col for col in merged_df.columns 
+               if (band in col) and ('POW.' in col) and ('EEG' not in col)]
+    
+    if not features:
+        print(f"未找到有效的{band}波特征！")
+        return pd.DataFrame()
+    
+    # 1. 功率差异检验
+    results = []
+    for feat in features:
+        # 按教育水平分组
+        groups = []
+        group_labels = []
+        for lvl in sorted(merged_df['Education Level'].unique()):
+            group_data = merged_df[merged_df['Education Level']==lvl][feat].dropna()
+            if len(group_data) > 3:  # 确保每组有足够样本
+                groups.append(group_data)
+                group_labels.append(lvl)
+        
+        # 仅在有足够组时进行分析
+        if len(groups) >= 2:
+            # 方差齐性检验
+            _, levene_p = stats.levene(*groups)
+            
+            # 选择检验方法
+            if levene_p > 0.05:
+                _, pval = stats.f_oneway(*groups)
+                test_method = 'ANOVA'
+            else:
+                _, pval = stats.kruskal(*groups)
+                test_method = 'Kruskal'
+            
+            # 计算效应量
+            if test_method == 'ANOVA':
+                eta_sq = calculate_effect_size(groups, 'eta')
+            else:
+                eta_sq = calculate_effect_size(groups, 'epsilon')
+            
+            results.append({
+                '特征': feat,
+                '检验方法': test_method,
+                'p值': pval,
+                '效应量': eta_sq,
+                '显著(p<0.05)': pval < 0.05
+            })
+    
+    if not results:
+        print("没有足够数据进行统计分析！")
+        return pd.DataFrame()
+    
+    result_df = pd.DataFrame(results).sort_values('p值')
+    
+    # 2. 可视化显著特征
+    sig_features = result_df[result_df['显著(p<0.05)']]
+    if not sig_features.empty:
+        print(f"\n发现{len(sig_features)}个显著差异特征：")
+        
+        for _, row in sig_features.iterrows():
+            feat = row['特征']
+            region = parse_brain_region(feat)
+            
+            # 创建可视化
+            plt.figure(figsize=(10, 6))
+            sns.boxplot(x='Education Level', y=feat, data=merged_df, 
+                       palette='pastel', width=0.6)
+            
+            # 添加统计标注
+            max_val = merged_df[feat].max()
+            plt.text(0.5, max_val*1.05, 
+                    f"p={row['p值']:.3f} ({row['检验方法']})", 
+                    ha='center', fontsize=10)
+            
+            plt.title(f'{region}区{band}波功率分布\n(效应量η²={row["效应量"]:.2f})')
+            plt.ylabel('标准化功率值')
+            plt.xticks(rotation=45)
+            plt.grid(axis='y', linestyle='--', alpha=0.5)
+            plt.tight_layout()
+            plt.show()
+            
+            # 事后检验（如果ANOVA显著）
+            if row['检验方法'] == 'ANOVA' and row['p值'] < 0.05:
+                print(f"\n{region}区事后检验：")
+                try:
+                    tukey = pairwise_tukeyhsd(
+                        endog=merged_df[feat].dropna(),
+                        groups=merged_df['Education Level'].dropna(),
+                        alpha=0.05
+                    )
+                    print(tukey.summary())
+                except Exception as e:
+                    print(f"事后检验失败: {str(e)}")
+    
+    return result_df
+def parse_brain_region(feature_name):
+    """解析脑区名称"""
+    parts = feature_name.split('.')
+    if len(parts) > 2:
+        region_code = parts[1]
+        region_map = {
+            'AF': '前额叶',
+            'F': '额叶',
+            'FC': '额中央区',
+            'T': '颞叶',
+            'P': '顶叶',
+            'O': '枕叶'
+        }
+        return region_map.get(region_code[:2], region_code)
+    return '全脑'
+def calculate_effect_size(groups, method='eta'):
+    """计算效应量"""
+    all_data = np.concatenate(groups)
+    grand_mean = np.mean(all_data)
+    
+    # 组间变异
+    ss_between = sum(len(g)*(np.mean(g)-grand_mean)**2 for g in groups)
+    
+    # 总变异
+    ss_total = sum((x-grand_mean)**2 for x in all_data)
+    
+    if method == 'eta':
+        return ss_between/ss_total if ss_total !=0 else 0
+    else:  # epsilon平方
+        ss_within = sum(sum((x-np.mean(g))**2 for x in g) for g in groups)
+        return (ss_between - (len(groups)-1)*ss_within/(len(all_data)-len(groups))) / ss_total
+def generate_teaching_recommendations(results_df, band):
+    """基于分析结果生成教学建议"""
+    sig_features = results_df[results_df['显著(p<0.05)']]
+    
+    if len(sig_features) == 0:
+        print(f"\n未发现{band}波功率在教育水平间的显著差异")
+        return
+    
+    print(f"\n基于{band}波分析的教学建议：")
+    
+    # 按脑区组织结果
+    region_results = {}
+    for _, row in sig_features.iterrows():
+        region = parse_brain_region(row['特征'])
+        if region not in region_results:
+            region_results[region] = []
+        region_results[region].append(row)
+    
+    # 生成建议
+    for region, items in region_results.items():
+        avg_effect = np.mean([x['效应量'] for x in items])
+        max_p = max(x['p值'] for x in items)
+        
+        print(f"\n▶ {region}区发现{len(items)}个显著特征：")
+        print(f"  平均效应量η² = {avg_effect:.2f}, 最大p值 = {max_p:.3f}")
+        
+        if band == 'Theta':
+            if region in ['前额叶', '额叶']:
+                print("  • 建议调整教学内容认知复杂度")
+                print("  • 可增加工作记忆训练活动")
+            elif region == '顶叶':
+                print("  • 需要加强空间信息呈现方式")
+        elif band == 'Alpha':
+            if region == '枕叶':
+                print("  • 建议优化视觉材料设计")
+            elif region in ['额叶', '前额叶']:
+                print("  • 可引入更多注意力调节练习")
+    
+    # 全局建议
+    if band == 'Theta':
+        print("\n全局建议：")
+        print("- 对低教育水平者采用更渐进的教学步骤")
+        print("- 对高教育水平者可增加认知挑战")
+    else:
+        print("\n全局建议：")
+        print("- 教学过程中安排适当的注意力休息期")
+        print("- 多样化信息呈现方式（视觉/听觉/动觉）")
+# ====================== 主执行流程 ======================
+if __name__ == '__main__':
+    # 加载数据（示例，需替换为实际数据加载代码）
+    # merged = pd.read_csv('processed_data.csv')
+    
+    # 1. 基础分析
+    edu_stats = education_level_analysis(merged)
+    
+    # 2. θ波分析
+    theta_results = band_education_analysis(merged, 'Theta')
+    generate_teaching_recommendations(theta_results, 'Theta')
+    
+    # 3. α波分析
+    alpha_results = band_education_analysis(merged, 'Alpha')
+    generate_teaching_recommendations(alpha_results, 'Alpha')
+    
+    # 4. 全局θ波同步性分析
+    print("\n正在进行全局θ波同步性分析...")
+    theta_features = [col for col in merged.columns if 'Theta' in col and 'POW.' in col]
+    if theta_features:
+        merged['Global_Theta'] = merged[theta_features].mean(axis=1)
+        
+        plt.figure(figsize=(10, 6))
+        sns.boxplot(x='Education Level', y='Global_Theta', data=merged, palette='Set2')
+        plt.title('全局θ波功率分布')
+        plt.ylabel('平均功率值')
+        plt.xticks(rotation=45)
+        plt.grid(axis='y', linestyle='--')
+        plt.show()
+        
+        # 统计检验
+        groups = [merged[merged['Education Level']==lvl]['Global_Theta'].dropna() 
+                 for lvl in merged['Education Level'].unique()]
+        _, pval = stats.kruskal(*groups)
+        print(f"\n全局θ波差异检验 p = {pval:.4f}")
+        
+        if pval < 0.05:
+            print("\n教学调整建议：")
+            print("• 不同教育水平群体表现出显著不同的θ波同步模式")
+            print("• 建议实施分层教学策略，针对不同群体设计不同认知负荷的活动")
+    else:
+        print("未找到有效的θ波特征！")
+#%% 修正后的数据分布可视化代码
+print("\n正在生成原始数据分布可视化...")
+plt.figure(figsize=(18, 20))
+# ----------------- 被试信息分布 -----------------
+# 年龄分布
+plt.subplot(3, 2, 1)
+age_bins = pd.cut(subjects['Age'], bins=[0, 12, 18, 25, 35, 45, 100], 
+                 labels=['儿童', '青少年', '青年', '中青年', '中年', '老年'])
+age_dist = age_bins.value_counts().sort_index()
+age_dist.plot(kind='bar', color='skyblue', edgecolor='black')
+plt.title('被试年龄分布')
+plt.xlabel('年龄区间')
+plt.ylabel('人数')
+# 性别分布
+plt.subplot(3, 2, 2)
+gender_dist = subjects['Gender'].value_counts()
+gender_dist.plot(kind='pie', autopct='%1.1f%%', 
+                colors=['lightcoral', 'lightgreen', 'lightblue'],
+                labels=['男性' if x == 'M' else '女性' for x in gender_dist.index])
+plt.title('性别分布')
+plt.ylabel('')
+# ----------------- 教育水平分布（修正后）-----------------
+plt.subplot(3, 2, 3)
+if 'Education Level' in subjects.columns:
+    # 自动生成教育水平排序（按年级排序）
+    education_order = [
+        'Middle School (6th Grade)',
+        'Middle School (8th Grade)',
+        'High School (10th Grade)',
+        'High School (12th Grade)',
+        'High School Graduate',
+        'University (4th year)'
+    ]
+    
+    edu_dist = subjects['Education Level'].value_counts().reindex(education_order).fillna(0)
+    
+    if not edu_dist.empty:
+        edu_dist.plot(kind='barh', color='gold', edgecolor='black')
+        plt.title('教育水平分布（按年级排序）')
+        plt.xlabel('人数')
+        plt.ylabel('教育阶段')
+        plt.yticks(rotation=20)
+    else:
+        plt.text(0.5, 0.5, '无有效教育水平数据', ha='center', va='center')
+        plt.title('教育水平分布 (数据异常)')
+else:
+    plt.text(0.5, 0.5, '无教育水平字段', ha='center', va='center')
+    plt.title('教育水平分布 (字段缺失)')
+# ----------------- 其他分布保持原样 -----------------
+# 兴趣领域分布
+plt.subplot(3, 2, 4)
+interests_dist = subjects['Fields of Interest'].value_counts()
+interests_dist.plot(kind='bar', color='lightseagreen', edgecolor='black')
+plt.title('兴趣领域分布')
+plt.xlabel('领域')
+plt.ylabel('人数')
+plt.xticks(rotation=30)
+# 视频类别分布
+plt.subplot(3, 2, 5)
+if 'Video_category' in videos.columns:
+    video_cat_dist = videos['Video_category'].value_counts()
+    video_cat_dist.plot(kind='bar', color='mediumpurple', edgecolor='black')
+    plt.title('视频类别分布')
+else:
+    plt.text(0.5, 0.5, '无视频类别字段', ha='center', va='center')
+    plt.title('视频类别分布 (字段缺失)')
+# 理解标签分布
+plt.subplot(3, 2, 6)
+if 'subject_understood' in eeg.columns:
+    label_dist = eeg['subject_understood'].value_counts()
+    label_dist.plot(kind='pie', autopct='%1.1f%%', 
+                   colors=['lightblue', 'pink'],
+                   labels=['未理解', '已理解'])
+    plt.title('理解标签分布')
+else:
+    plt.text(0.5, 0.5, '无理解标签字段', ha='center', va='center')
+    plt.title('理解标签分布 (字段缺失)')
+plt.tight_layout()
+plt.show()
+# 显示关键统计信息
+print("\n关键统计信息:")
+print("1. 被试平均年龄:", f"{subjects['Age'].mean():.1f} 岁")
+print("2. 被试年龄标准差:", f"{subjects['Age'].std():.1f} 岁")
+print("3. 教育阶段分布:")
+print(subjects['Education Level'].value_counts().to_string())
+print("\n4. 视频教学主题多样性:", len(videos['Title'].unique()), "个不同主题")
