@@ -1,0 +1,158 @@
+# -*- coding: utf-8 -*-
+# 移除mne等预处理相关导入
+import matplotlib.pyplot as plt
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import accuracy_score, roc_auc_score
+from tqdm import tqdm
+
+plt.rcParams['font.sans-serif'] = ['SimHei']
+plt.rcParams['axes.unicode_minus'] = False
+
+# 加载数据
+eeg = pd.read_csv("EEG_data.csv")
+subjects = pd.read_csv("Subject_details.csv")
+videos = pd.read_csv("Video_details.csv")
+
+# 合并数据（保持原始结构）
+merged = eeg.merge(
+    subjects,
+    left_on="subject_id",
+    right_on="Subject_ID",
+    how="left"
+).merge(
+    videos,
+    left_on="video_id",
+    right_on="Video_ID",
+    how="left"
+)
+
+# 验证列名（关键修改）
+print("可用列名:", merged.columns.tolist())
+
+# 根据实际列名调整特征定义（示例值，需根据实际数据调整）
+numeric_features = [col for col in merged.columns if col.startswith('EEG.') or col.startswith('POW.')] + ['Age']
+categorical_features = ['Education Level', 'Gender']  # 简化分类特征
+
+# 数据管道（保持结构）
+numeric_transformer = Pipeline([
+    ('imputer', SimpleImputer(strategy='median')),
+    ('scaler', StandardScaler())
+])
+
+categorical_transformer = Pipeline([
+    ('imputer', SimpleImputer(strategy='most_frequent')),
+    ('onehot', OneHotEncoder(handle_unknown='ignore'))
+])
+
+preprocessor = ColumnTransformer([
+    ('num', numeric_transformer, numeric_features),
+    ('cat', categorical_transformer, categorical_features)
+])
+
+# 后续流程保持不变
+X = preprocessor.fit_transform(merged)
+y = merged['subject_understood'].values
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, stratify=y, random_state=42)
+
+X_train_tensor = torch.FloatTensor(X_train.toarray() if hasattr(X_train, "toarray") else X_train)
+X_test_tensor = torch.FloatTensor(X_test.toarray() if hasattr(X_test, "toarray") else X_test)
+y_train_tensor = torch.FloatTensor(y_train).reshape(-1, 1)
+y_test_tensor = torch.FloatTensor(y_test).reshape(-1, 1)
+
+# 保持模型结构不变
+class EEGClassifier(nn.Module):
+    def __init__(self, input_dim):
+        super().__init__()
+        self.layers = nn.Sequential(
+            nn.Linear(input_dim, 256),
+            nn.ReLU(),
+            nn.BatchNorm1d(256),
+            nn.Dropout(0.5),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.BatchNorm1d(128),
+            nn.Dropout(0.3),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1),
+            nn.Sigmoid()
+        )
+    
+    def forward(self, x):
+        return self.layers(x)
+
+# 训练流程保持不变
+model = EEGClassifier(X_train_tensor.shape[1])
+criterion = nn.BCELoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
+
+def train_model(model, criterion, optimizer, X_train, y_train, X_test, y_test, epochs=50, batch_size=32):
+    train_losses = []
+    test_losses = []
+    accuracies = []
+    
+    for epoch in range(epochs):
+        model.train()
+        permutation = torch.randperm(X_train.size()[0])
+        
+        for i in range(0, X_train.size()[0], batch_size):
+            indices = permutation[i:i+batch_size]
+            batch_X, batch_y = X_train[indices], y_train[indices]
+            
+            optimizer.zero_grad()
+            outputs = model(batch_X)
+            loss = criterion(outputs, batch_y)
+            loss.backward()
+            optimizer.step()
+        
+        # 评估
+        model.eval()
+        with torch.no_grad():
+            # 训练集评估
+            train_outputs = model(X_train)
+            train_loss = criterion(train_outputs, y_train)
+            
+            # 测试集评估
+            test_outputs = model(X_test)
+            test_loss = criterion(test_outputs, y_test)
+            
+            # 计算准确率
+            predicted = (test_outputs > 0.5).float()
+            accuracy = (predicted == y_test).float().mean()
+            
+        train_losses.append(train_loss.item())
+        test_losses.append(test_loss.item())
+        accuracies.append(accuracy.item())
+        
+        if (epoch+1) % 5 == 0:
+            print(f'Epoch {epoch+1}/{epochs}, Train Loss: {train_loss.item():.4f}, Test Loss: {test_loss.item():.4f}, Accuracy: {accuracy.item():.4f}')
+    
+    return train_losses, test_losses, accuracies
+
+# 训练和评估
+train_losses, test_losses, accuracies = train_model(
+    model, criterion, optimizer, 
+    X_train_tensor, y_train_tensor, 
+    X_test_tensor, y_test_tensor,
+    epochs=100, batch_size=64
+)
+
+model.eval()
+with torch.no_grad():
+    y_pred = model(X_test_tensor)
+    y_pred_class = (y_pred > 0.5).float()
+    test_accuracy = accuracy_score(y_test, y_pred_class.numpy())
+    test_auc = roc_auc_score(y_test, y_pred.numpy())
+    
+print(f"\nFinal Test Accuracy: {test_accuracy:.4f}")
+print(f"Final Test AUC: {test_auc:.4f}")
